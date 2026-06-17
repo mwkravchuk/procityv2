@@ -1,6 +1,8 @@
 export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8080'
 
+export const API_WS_BASE_URL = API_BASE_URL.replace(/^http/, 'ws')
+
 export type User = {
   id: number
   displayName: string
@@ -17,6 +19,7 @@ export type QueueState = {
   count: number
   entries: QueueEntry[]
   mostRecentMatchId?: number
+  activeMatchId?: number
 }
 
 export type Match = {
@@ -82,8 +85,9 @@ export function devLogin(displayName: string) {
   })
 }
 
-export function getQueueState() {
-  return request<QueueState>('/queue/state')
+export function getQueueState(userId?: number) {
+  const query = userId ? `?userId=${userId}` : ''
+  return request<QueueState>(`/queue/state${query}`)
 }
 
 export function joinQueue(userId: number) {
@@ -100,14 +104,18 @@ export function leaveQueue(userId: number) {
   })
 }
 
-export function assignDraftCaptains(matchId: number) {
-  return request<DraftState>(`/matches/${matchId}/draft/captains`, {
+export function assignDraftCaptains(matchId: number, userId: number) {
+  return request<DraftState>(`/matches/${matchId}/draft/captains?userId=${userId}`, {
     method: 'POST',
   })
 }
 
-export function getDraftState(matchId: number) {
-  return request<DraftState>(`/matches/${matchId}/draft/state`)
+export function getDraftState(matchId: number, userId: number) {
+  return request<DraftState>(`/matches/${matchId}/draft/state?userId=${userId}`)
+}
+
+export function draftSocketUrl(matchId: number, userId: number) {
+  return `${API_WS_BASE_URL}/matches/${matchId}/draft/ws?userId=${userId}`
 }
 
 export function submitDraftPick(

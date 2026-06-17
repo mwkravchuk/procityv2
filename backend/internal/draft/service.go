@@ -20,6 +20,7 @@ var (
 	ErrNotCaptainTurn      = errors.New("captain is not on the clock")
 	ErrPlayerUnavailable   = errors.New("player is not available to draft")
 	ErrExpectedTwoCaptains = errors.New("match must have exactly two captains")
+	ErrMatchAccessDenied   = errors.New("user is not in this match")
 )
 
 type Service struct {
@@ -279,6 +280,56 @@ func (s *Service) State(ctx context.Context, matchID int64) (models.DraftState, 
 	}
 
 	return state, nil
+}
+
+func (s *Service) StateForUser(ctx context.Context, matchID int64, userID int64) (models.DraftState, error) {
+	if err := s.RequireParticipant(ctx, matchID, userID); err != nil {
+		return models.DraftState{}, err
+	}
+	return s.State(ctx, matchID)
+}
+
+func (s *Service) RequireParticipant(ctx context.Context, matchID int64, userID int64) error {
+	var matchExists bool
+	var isParticipant bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM matches WHERE id = $1),
+			EXISTS(
+				SELECT 1
+				FROM match_players
+				WHERE match_id = $1 AND user_id = $2
+			)
+	`, matchID, userID).Scan(&matchExists, &isParticipant); err != nil {
+		return err
+	}
+	if !matchExists {
+		return ErrMatchNotFound
+	}
+	if !isParticipant {
+		return ErrMatchAccessDenied
+	}
+	return nil
+}
+
+func (s *Service) ActiveMatchForUser(ctx context.Context, userID int64) (*int64, error) {
+	var matchID int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT m.id
+		FROM matches m
+		JOIN match_players mp ON mp.match_id = m.id
+		WHERE mp.user_id = $1
+			AND m.status IN ('drafting', 'ready', 'in_progress')
+		ORDER BY m.created_at DESC, m.id DESC
+		LIMIT 1
+	`, userID).Scan(&matchID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &matchID, nil
 }
 
 func (s *Service) loadPlayers(ctx context.Context, matchID int64) ([]models.MatchPlayer, error) {

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/procity/procityv2/backend/internal/draft"
@@ -16,6 +18,7 @@ import (
 
 type Server struct {
 	draftSvc *draft.Service
+	draftHub *draft.Hub
 	queueSvc *queue.Service
 	pool     *pgxpool.Pool
 }
@@ -23,9 +26,16 @@ type Server struct {
 func NewServer(pool *pgxpool.Pool) *Server {
 	return &Server{
 		draftSvc: draft.NewService(pool),
+		draftHub: draft.NewHub(),
 		queueSvc: queue.NewService(pool),
 		pool:     pool,
 	}
+}
+
+var draftUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
 }
 
 func (s *Server) Router() http.Handler {
@@ -44,6 +54,7 @@ func (s *Server) Router() http.Handler {
 	r.Post("/matches/{matchID}/draft/captains", s.handleDraftAssignCaptains)
 	r.Get("/matches/{matchID}/draft/state", s.handleDraftState)
 	r.Post("/matches/{matchID}/draft/picks", s.handleDraftPick)
+	r.Get("/matches/{matchID}/draft/ws", s.handleDraftSocket)
 
 	return r
 }
@@ -151,6 +162,19 @@ func (s *Server) handleQueueState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID, hasUserID, ok := optionalUserIDFromQuery(w, r)
+	if !ok {
+		return
+	}
+	if hasUserID {
+		activeMatchID, err := s.draftSvc.ActiveMatchForUser(r.Context(), userID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to load active match")
+			return
+		}
+		state.ActiveMatchID = activeMatchID
+	}
+
 	writeJSON(w, http.StatusOK, state)
 }
 
@@ -165,6 +189,14 @@ func (s *Server) handleDraftAssignCaptains(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	userID, ok := requiredUserIDFromQuery(w, r)
+	if !ok {
+		return
+	}
+	if err := s.draftSvc.RequireParticipant(r.Context(), matchID, userID); err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
 
 	if err := s.draftSvc.AssignCaptains(r.Context(), matchID); err != nil {
 		s.writeDraftError(w, err)
@@ -177,6 +209,7 @@ func (s *Server) handleDraftAssignCaptains(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	s.draftHub.Broadcast(state)
 	writeJSON(w, http.StatusOK, state)
 }
 
@@ -185,8 +218,12 @@ func (s *Server) handleDraftState(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	userID, ok := requiredUserIDFromQuery(w, r)
+	if !ok {
+		return
+	}
 
-	state, err := s.draftSvc.State(r.Context(), matchID)
+	state, err := s.draftSvc.StateForUser(r.Context(), matchID, userID)
 	if err != nil {
 		s.writeDraftError(w, err)
 		return
@@ -219,6 +256,11 @@ func (s *Server) handleDraftPick(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.draftSvc.RequireParticipant(r.Context(), matchID, req.CaptainUserID); err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
 	err := s.draftSvc.SubmitPick(r.Context(), matchID, draft.SubmitPickInput{
 		CaptainUserID: req.CaptainUserID,
 		PickedUserID:  req.PickedUserID,
@@ -235,7 +277,64 @@ func (s *Server) handleDraftPick(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.draftHub.Broadcast(state)
 	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleDraftSocket(w http.ResponseWriter, r *http.Request) {
+	matchID, ok := matchIDFromRequest(w, r)
+	if !ok {
+		return
+	}
+	userID, ok := requiredUserIDFromQuery(w, r)
+	if !ok {
+		return
+	}
+
+	state, err := s.draftSvc.StateForUser(r.Context(), matchID, userID)
+	if err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	conn, err := draftUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		defer cancel()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	updates, unsubscribe := s.draftHub.Subscribe(matchID)
+	defer unsubscribe()
+
+	if err := conn.WriteJSON(state); err != nil {
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case nextState, ok := <-updates:
+			if !ok {
+				return
+			}
+			if err := conn.WriteJSON(nextState); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func matchIDFromRequest(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -245,6 +344,31 @@ func matchIDFromRequest(w http.ResponseWriter, r *http.Request) (int64, bool) {
 		return 0, false
 	}
 	return matchID, true
+}
+
+func requiredUserIDFromQuery(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	userID, hasUserID, ok := optionalUserIDFromQuery(w, r)
+	if !ok {
+		return 0, false
+	}
+	if !hasUserID {
+		writeError(w, http.StatusBadRequest, "userId query parameter is required")
+		return 0, false
+	}
+	return userID, true
+}
+
+func optionalUserIDFromQuery(w http.ResponseWriter, r *http.Request) (int64, bool, bool) {
+	rawUserID := strings.TrimSpace(r.URL.Query().Get("userId"))
+	if rawUserID == "" {
+		return 0, false, true
+	}
+	userID, err := strconv.ParseInt(rawUserID, 10, 64)
+	if err != nil || userID <= 0 {
+		writeError(w, http.StatusBadRequest, "userId must be positive")
+		return 0, false, false
+	}
+	return userID, true, true
 }
 
 func (s *Server) writeDraftError(w http.ResponseWriter, err error) {
@@ -263,6 +387,8 @@ func (s *Server) writeDraftError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, draft.ErrPlayerUnavailable):
 		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, draft.ErrMatchAccessDenied):
+		writeError(w, http.StatusForbidden, err.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "failed to update draft")
 	}

@@ -60,4 +60,5 @@ type QueueState struct {
 	Count             int          `json:"count"`
 	Entries           []QueueEntry `json:"entries"`
 	MostRecentMatchID *int64       `json:"mostRecentMatchId,omitempty"`
+	ActiveMatchID     *int64       `json:"activeMatchId,omitempty"`
 }

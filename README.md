@@ -63,12 +63,13 @@ Frontend defaults to `http://localhost:5173` and calls API at `http://localhost:
 ## Current API Endpoints
 - `GET /health`
 - `POST /auth/dev-login` body: `{ "displayName": "name" }`
-- `GET /queue/state`
+- `GET /queue/state?userId=1`
 - `POST /queue/join` body: `{ "userId": 1 }`
 - `POST /queue/leave` body: `{ "userId": 1 }`
-- `POST /matches/{matchID}/draft/captains`
-- `GET /matches/{matchID}/draft/state`
+- `POST /matches/{matchID}/draft/captains?userId=1`
+- `GET /matches/{matchID}/draft/state?userId=1`
 - `POST /matches/{matchID}/draft/picks` body: `{ "captainUserId": 1, "pickedUserId": 2, "pickNumber": 1 }`
+- `GET /matches/{matchID}/draft/ws?userId=1`
 
 ## Queue Promotion Behavior
 - Queue table is intentionally minimal: `id`, `user_id`, `created_at`
@@ -87,6 +88,10 @@ This gives deterministic promotion and race-safe behavior under concurrent joins
 
 ## Draft Behavior
 - Captains are assigned randomly when a match is created
+- Frontend match pages live at `/matches/{matchID}`
+- Draft pages load one HTTP snapshot, then subscribe to match-scoped WebSocket updates
+- The WebSocket broadcasts the full `DraftState` after draft mutations
+- Snapshot endpoints remain the recovery path for refreshes, reconnects, and closed tabs
 - Draft order is snake-style by team: `1, 2, 2, 1, 1, 2, 2, 1`
 - The pick endpoint validates `pickNumber`, captain turn, and player availability server-side
 - Each submitted pick updates `match_players.team`, sets `draft_pick_position`, and appends a `match_draft_picks` timeline row
