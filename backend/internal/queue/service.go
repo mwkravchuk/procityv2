@@ -115,13 +115,17 @@ func (s *Service) Join(ctx context.Context, userID int64) (JoinResult, error) {
 		return JoinResult{}, err
 	}
 
-	for pick, queuedUserID := range userIDs {
+	for _, queuedUserID := range userIDs {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO match_players (match_id, user_id, draft_pick_position)
-			VALUES ($1, $2, $3)
-		`, matchID, queuedUserID, pick+1); err != nil {
+			INSERT INTO match_players (match_id, user_id)
+			VALUES ($1, $2)
+		`, matchID, queuedUserID); err != nil {
 			return JoinResult{}, err
 		}
+	}
+
+	if err := s.assignRandomCaptains(ctx, tx, matchID); err != nil {
+		return JoinResult{}, err
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM queue_entries WHERE id = ANY($1)`, entryIDs); err != nil {
@@ -133,6 +137,33 @@ func (s *Service) Join(ctx context.Context, userID int64) (JoinResult, error) {
 	}
 
 	return JoinResult{CreatedMatchID: &matchID}, nil
+}
+
+func (s *Service) assignRandomCaptains(ctx context.Context, tx pgx.Tx, matchID int64) error {
+	tag, err := tx.Exec(ctx, `
+		WITH selected AS (
+			SELECT id, ROW_NUMBER() OVER ()::smallint AS team
+			FROM (
+				SELECT id
+				FROM match_players
+				WHERE match_id = $1
+				ORDER BY random()
+				LIMIT 2
+			) random_players
+		)
+		UPDATE match_players mp
+		SET is_captain = true,
+			team = selected.team
+		FROM selected
+		WHERE mp.id = selected.id
+	`, matchID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 2 {
+		return fmt.Errorf("expected 2 captains for match %d, assigned %d", matchID, tag.RowsAffected())
+	}
+	return nil
 }
 
 func (s *Service) selectRandomActiveMap(ctx context.Context, tx pgx.Tx) (string, error) {

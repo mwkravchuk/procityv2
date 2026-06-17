@@ -19,6 +19,47 @@ export type QueueState = {
   mostRecentMatchId?: number
 }
 
+export type Match = {
+  id: number
+  seasonId: number
+  status: string
+  mapName: string
+  createdAt: string
+  startedAt?: string
+  endedAt?: string
+}
+
+export type MatchPlayer = {
+  id: number
+  userId: number
+  displayName: string
+  team?: number
+  isCaptain: boolean
+  draftPickPosition?: number
+}
+
+export type DraftPick = {
+  id: number
+  matchId: number
+  pickNumber: number
+  captainUserId: number
+  captainDisplayName: string
+  pickedUserId: number
+  pickedDisplayName: string
+  team: number
+  createdAt: string
+}
+
+export type DraftState = {
+  match: Match
+  captains: MatchPlayer[]
+  availablePlayers: MatchPlayer[]
+  picks: DraftPick[]
+  nextPickNumber?: number
+  currentCaptain?: MatchPlayer
+  isComplete: boolean
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
@@ -56,5 +97,27 @@ export function leaveQueue(userId: number) {
   return request<{ status: string }>('/queue/leave', {
     method: 'POST',
     body: JSON.stringify({ userId }),
+  })
+}
+
+export function assignDraftCaptains(matchId: number) {
+  return request<DraftState>(`/matches/${matchId}/draft/captains`, {
+    method: 'POST',
+  })
+}
+
+export function getDraftState(matchId: number) {
+  return request<DraftState>(`/matches/${matchId}/draft/state`)
+}
+
+export function submitDraftPick(
+  matchId: number,
+  captainUserId: number,
+  pickedUserId: number,
+  pickNumber: number,
+) {
+  return request<DraftState>(`/matches/${matchId}/draft/picks`, {
+    method: 'POST',
+    body: JSON.stringify({ captainUserId, pickedUserId, pickNumber }),
   })
 }

@@ -66,6 +66,9 @@ Frontend defaults to `http://localhost:5173` and calls API at `http://localhost:
 - `GET /queue/state`
 - `POST /queue/join` body: `{ "userId": 1 }`
 - `POST /queue/leave` body: `{ "userId": 1 }`
+- `POST /matches/{matchID}/draft/captains`
+- `GET /matches/{matchID}/draft/state`
+- `POST /matches/{matchID}/draft/picks` body: `{ "captainUserId": 1, "pickedUserId": 2, "pickNumber": 1 }`
 
 ## Queue Promotion Behavior
 - Queue table is intentionally minimal: `id`, `user_id`, `created_at`
@@ -76,7 +79,14 @@ Frontend defaults to `http://localhost:5173` and calls API at `http://localhost:
   - lock 10 oldest entries (`FOR UPDATE SKIP LOCKED`)
   - pick random active map from `maps`
   - create `matches` row in `drafting`
-  - create `match_players` rows
+  - create `match_players` rows (draft positions assigned later during captain draft)
+  - randomly assign two captains onto teams 1 and 2
   - delete consumed queue entries
 
 This gives deterministic promotion and race-safe behavior under concurrent joins.
+
+## Draft Behavior
+- Captains are assigned randomly when a match is created
+- Draft order is snake-style by team: `1, 2, 2, 1, 1, 2, 2, 1`
+- The pick endpoint validates `pickNumber`, captain turn, and player availability server-side
+- Each submitted pick updates `match_players.team`, sets `draft_pick_position`, and appends a `match_draft_picks` timeline row

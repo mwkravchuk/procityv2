@@ -4,21 +4,25 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/procity/procityv2/backend/internal/draft"
 	"github.com/procity/procityv2/backend/internal/queue"
 )
 
 type Server struct {
+	draftSvc *draft.Service
 	queueSvc *queue.Service
 	pool     *pgxpool.Pool
 }
 
 func NewServer(pool *pgxpool.Pool) *Server {
 	return &Server{
+		draftSvc: draft.NewService(pool),
 		queueSvc: queue.NewService(pool),
 		pool:     pool,
 	}
@@ -36,6 +40,10 @@ func (s *Server) Router() http.Handler {
 	r.Get("/queue/state", s.handleQueueState)
 	r.Post("/queue/join", s.handleQueueJoin)
 	r.Post("/queue/leave", s.handleQueueLeave)
+
+	r.Post("/matches/{matchID}/draft/captains", s.handleDraftAssignCaptains)
+	r.Get("/matches/{matchID}/draft/state", s.handleDraftState)
+	r.Post("/matches/{matchID}/draft/picks", s.handleDraftPick)
 
 	return r
 }
@@ -144,6 +152,120 @@ func (s *Server) handleQueueState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, state)
+}
+
+type draftPickRequest struct {
+	CaptainUserID int64 `json:"captainUserId"`
+	PickedUserID  int64 `json:"pickedUserId"`
+	PickNumber    int16 `json:"pickNumber"`
+}
+
+func (s *Server) handleDraftAssignCaptains(w http.ResponseWriter, r *http.Request) {
+	matchID, ok := matchIDFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	if err := s.draftSvc.AssignCaptains(r.Context(), matchID); err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	state, err := s.draftSvc.State(r.Context(), matchID)
+	if err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleDraftState(w http.ResponseWriter, r *http.Request) {
+	matchID, ok := matchIDFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	state, err := s.draftSvc.State(r.Context(), matchID)
+	if err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleDraftPick(w http.ResponseWriter, r *http.Request) {
+	matchID, ok := matchIDFromRequest(w, r)
+	if !ok {
+		return
+	}
+
+	var req draftPickRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if req.CaptainUserID <= 0 {
+		writeError(w, http.StatusBadRequest, "captainUserId must be positive")
+		return
+	}
+	if req.PickedUserID <= 0 {
+		writeError(w, http.StatusBadRequest, "pickedUserId must be positive")
+		return
+	}
+	if req.PickNumber < 1 || req.PickNumber > 8 {
+		writeError(w, http.StatusBadRequest, "pickNumber must be between 1 and 8")
+		return
+	}
+
+	err := s.draftSvc.SubmitPick(r.Context(), matchID, draft.SubmitPickInput{
+		CaptainUserID: req.CaptainUserID,
+		PickedUserID:  req.PickedUserID,
+		PickNumber:    req.PickNumber,
+	})
+	if err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	state, err := s.draftSvc.State(r.Context(), matchID)
+	if err != nil {
+		s.writeDraftError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, state)
+}
+
+func matchIDFromRequest(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	matchID, err := strconv.ParseInt(chi.URLParam(r, "matchID"), 10, 64)
+	if err != nil || matchID <= 0 {
+		writeError(w, http.StatusBadRequest, "matchID must be positive")
+		return 0, false
+	}
+	return matchID, true
+}
+
+func (s *Server) writeDraftError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, draft.ErrMatchNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, draft.ErrMatchNotDrafting):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, draft.ErrInvalidCaptains), errors.Is(err, draft.ErrExpectedTwoCaptains):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, draft.ErrDraftComplete):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, draft.ErrInvalidPickNumber):
+		writeError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, draft.ErrNotCaptainTurn):
+		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, draft.ErrPlayerUnavailable):
+		writeError(w, http.StatusConflict, err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "failed to update draft")
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
