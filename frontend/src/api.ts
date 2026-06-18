@@ -90,6 +90,11 @@ export function getQueueState(userId?: number) {
   return request<QueueState>(`/queue/state${query}`)
 }
 
+export function queueSocketUrl(userId?: number) {
+  const query = userId ? `?userId=${userId}` : ''
+  return `${API_WS_BASE_URL}/queue/ws${query}`
+}
+
 export function joinQueue(userId: number) {
   return request<{ createdMatchId?: number }>('/queue/join', {
     method: 'POST',

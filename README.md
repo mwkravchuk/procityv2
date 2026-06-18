@@ -64,6 +64,7 @@ Frontend defaults to `http://localhost:5173` and calls API at `http://localhost:
 - `GET /health`
 - `POST /auth/dev-login` body: `{ "displayName": "name" }`
 - `GET /queue/state?userId=1`
+- `GET /queue/ws?userId=1`
 - `POST /queue/join` body: `{ "userId": 1 }`
 - `POST /queue/leave` body: `{ "userId": 1 }`
 - `POST /matches/{matchID}/draft/captains?userId=1`
@@ -76,6 +77,8 @@ Frontend defaults to `http://localhost:5173` and calls API at `http://localhost:
 - Map pool is database-backed in `maps` with `is_active` flag
 - A unique `user_id` constraint prevents double-join
 - On join, backend transaction checks queue length
+- Queue pages load one HTTP snapshot, then subscribe to queue WebSocket updates
+- Queue join, leave, and match promotion all broadcast fresh queue snapshots to connected clients
 - If at least 10 players are queued:
   - lock 10 oldest entries (`FOR UPDATE SKIP LOCKED`)
   - pick random active map from `maps`

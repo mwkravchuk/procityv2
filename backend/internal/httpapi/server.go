@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/procity/procityv2/backend/internal/draft"
+	"github.com/procity/procityv2/backend/internal/models"
 	"github.com/procity/procityv2/backend/internal/queue"
 )
 
@@ -20,6 +21,7 @@ type Server struct {
 	draftSvc *draft.Service
 	draftHub *draft.Hub
 	queueSvc *queue.Service
+	queueHub *queueHub
 	pool     *pgxpool.Pool
 }
 
@@ -28,11 +30,12 @@ func NewServer(pool *pgxpool.Pool) *Server {
 		draftSvc: draft.NewService(pool),
 		draftHub: draft.NewHub(),
 		queueSvc: queue.NewService(pool),
+		queueHub: newQueueHub(),
 		pool:     pool,
 	}
 }
 
-var draftUpgrader = websocket.Upgrader{
+var websocketUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -50,6 +53,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/queue/state", s.handleQueueState)
 	r.Post("/queue/join", s.handleQueueJoin)
 	r.Post("/queue/leave", s.handleQueueLeave)
+	r.Get("/queue/ws", s.handleQueueSocket)
 
 	r.Post("/matches/{matchID}/draft/captains", s.handleDraftAssignCaptains)
 	r.Get("/matches/{matchID}/draft/state", s.handleDraftState)
@@ -127,6 +131,7 @@ func (s *Server) handleQueueJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.queueHub.Broadcast()
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -152,30 +157,106 @@ func (s *Server) handleQueueLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.queueHub.Broadcast()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "left"})
 }
 
 func (s *Server) handleQueueState(w http.ResponseWriter, r *http.Request) {
-	state, err := s.queueSvc.State(r.Context())
+	userID, hasUserID, ok := optionalUserIDFromQuery(w, r)
+	if !ok {
+		return
+	}
+	var scopedUserID *int64
+	if hasUserID {
+		scopedUserID = &userID
+	}
+
+	state, err := s.queueStateForUser(r.Context(), scopedUserID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load queue state")
 		return
 	}
 
+	writeJSON(w, http.StatusOK, state)
+}
+
+func (s *Server) handleQueueSocket(w http.ResponseWriter, r *http.Request) {
 	userID, hasUserID, ok := optionalUserIDFromQuery(w, r)
 	if !ok {
 		return
 	}
+	var scopedUserID *int64
 	if hasUserID {
-		activeMatchID, err := s.draftSvc.ActiveMatchForUser(r.Context(), userID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load active match")
-			return
-		}
-		state.ActiveMatchID = activeMatchID
+		scopedUserID = &userID
 	}
 
-	writeJSON(w, http.StatusOK, state)
+	state, err := s.queueStateForUser(r.Context(), scopedUserID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load queue state")
+		return
+	}
+
+	conn, err := websocketUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		defer cancel()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	updates, unsubscribe := s.queueHub.Subscribe()
+	defer unsubscribe()
+
+	if err := conn.WriteJSON(state); err != nil {
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-updates:
+			if !ok {
+				return
+			}
+			nextState, err := s.queueStateForUser(ctx, scopedUserID)
+			if err != nil {
+				_ = conn.WriteJSON(map[string]string{"error": "failed to load queue state"})
+				return
+			}
+			if err := conn.WriteJSON(nextState); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) queueStateForUser(ctx context.Context, userID *int64) (models.QueueState, error) {
+	state, err := s.queueSvc.State(ctx)
+	if err != nil {
+		return state, err
+	}
+
+	if userID == nil {
+		return state, nil
+	}
+
+	activeMatchID, err := s.draftSvc.ActiveMatchForUser(ctx, *userID)
+	if err != nil {
+		return state, err
+	}
+	state.ActiveMatchID = activeMatchID
+	return state, nil
 }
 
 type draftPickRequest struct {
@@ -297,7 +378,7 @@ func (s *Server) handleDraftSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := draftUpgrader.Upgrade(w, r, nil)
+	conn, err := websocketUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}

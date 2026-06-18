@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getQueueState, joinQueue, leaveQueue } from '../api'
+import { getQueueState, joinQueue, leaveQueue, queueSocketUrl } from '../api'
 import type { QueueState } from '../api'
 import { AppHeader } from '../components/AppHeader'
 import { DevLogin } from '../components/DevLogin'
@@ -38,19 +38,43 @@ export function QueuePage() {
   }, [navigate])
 
   useEffect(() => {
-    const kickoff = window.setTimeout(() => {
-      void refreshQueue()
-    }, 0)
+    let socket: WebSocket | null = null
+    let reconnectTimer: number | undefined
+    let cancelled = false
 
-    const timer = window.setInterval(() => {
+    const connect = () => {
+      if (cancelled) return
+
       void refreshQueue()
-    }, 3000)
+      socket = new WebSocket(queueSocketUrl(user?.id))
+
+      socket.onmessage = (event) => {
+        setQueueState(JSON.parse(event.data) as QueueState)
+        setError(null)
+      }
+
+      socket.onclose = () => {
+        if (!cancelled) {
+          reconnectTimer = window.setTimeout(connect, 1000)
+        }
+      }
+
+      socket.onerror = () => {
+        socket?.close()
+      }
+    }
+
+    const kickoff = window.setTimeout(connect, 0)
 
     return () => {
+      cancelled = true
       window.clearTimeout(kickoff)
-      window.clearInterval(timer)
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer)
+      }
+      socket?.close()
     }
-  }, [refreshQueue])
+  }, [refreshQueue, user?.id])
 
   useEffect(() => {
     if (!user || !activeMatchId) return
